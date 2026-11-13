@@ -168,3 +168,9 @@ void nghttp2_option_set_max_outbound_queue_size(nghttp2_option *option,
   option->opt_set_mask |= NGHTTP2_OPT_MAX_OUTBOUND_QUEUE_SIZE;
   option->max_outbound_queue_size = val;
 }
+
+void nghttp2_option_set_hpack_desync_recovery(nghttp2_option *option,
+                                              int val) {
+  option->opt_set_mask |= NGHTTP2_OPT_HPACK_DESYNC_RECOVERY;
+  option->hpack_desync_recovery = val;
+}

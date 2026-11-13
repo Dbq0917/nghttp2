@@ -3279,6 +3279,40 @@ nghttp2_option_set_max_outbound_queue_size(nghttp2_option *option, size_t val);
 /**
  * @function
  *
+ * If this option is used with nonzero |val|, the library attempts to
+ * recover from an HPACK encoder/decoder dynamic table desync instead
+ * of immediately terminating the connection when header
+ * decompression fails, or when a received header block cannot be
+ * decompressed (which would otherwise poison the inflator and
+ * eventually take down the whole connection).
+ *
+ * When a desync is detected, the library resets both the local
+ * inflater and deflater dynamic tables, and sends SETTINGS with
+ * SETTINGS_HEADER_TABLE_SIZE = 0, which forces the remote encoder to
+ * empty its dynamic table as well (see RFC 7541, Section 4.2).  Once
+ * the SETTINGS is acknowledged, the original table size is restored
+ * in another SETTINGS, and both peers resume from an empty,
+ * synchronized dynamic table.  Only the streams whose header blocks
+ * cannot be decompressed are reset (with RST_STREAM); the connection
+ * and all other streams survive.
+ *
+ * If desyncs keep happening (more than a few times within a short
+ * period of time), the library gives up and terminates the connection
+ * as it would without this option.
+ *
+ * Note that while a recovery is in progress, the application should
+ * not submit its own SETTINGS_HEADER_TABLE_SIZE change.
+ *
+ * By default, this option is disabled, and a header decompression
+ * failure results in connection termination as required by RFC 7540,
+ * Section 4.3.
+ */
+NGHTTP2_EXTERN void
+nghttp2_option_set_hpack_desync_recovery(nghttp2_option *option, int val);
+
+/**
+ * @function
+ *
  * Initializes |*session_ptr| for client use.  The all members of
  * |callbacks| are copied to |*session_ptr|.  Therefore |*session_ptr|
  * does not store |callbacks|.  The |user_data| is an arbitrary user

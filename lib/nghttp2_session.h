@@ -55,6 +55,7 @@ extern nghttp2_stream nghttp2_stream_root;
 #define NGHTTP2_OPTMASK_NO_HTTP_MESSAGING 0x04U
 #define NGHTTP2_OPTMASK_NO_AUTO_PING_ACK 0x08U
 #define NGHTTP2_OPTMASK_NO_RFC9113_LEADING_AND_TRAILING_WS_VALIDATION 0x40U
+#define NGHTTP2_OPTMASK_HPACK_DESYNC_RECOVERY 0x10U
 
 /*
  * bitmask for built-in type to enable the default handling for that
@@ -105,6 +106,13 @@ typedef struct {
 /* The default values for glitch rate limiter. */
 #define NGHTTP2_DEFAULT_GLITCH_BURST 10000
 #define NGHTTP2_DEFAULT_GLITCH_RATE 330
+
+/* HPACK desync recovery is attempted at most
+   NGHTTP2_HD_RECOVERY_MAX_ATTEMPTS times within
+   NGHTTP2_HD_RECOVERY_WINDOW_SEC seconds.  If desyncs happen more
+   often, the connection is terminated. */
+#define NGHTTP2_HD_RECOVERY_MAX_ATTEMPTS 5
+#define NGHTTP2_HD_RECOVERY_WINDOW_SEC 60
 
 /* The default max number of CONTINUATION frames following an incoming
    HEADER frame. */
@@ -330,6 +338,21 @@ struct nghttp2_session {
   nghttp2_settings_storage remote_settings;
   /* Settings value of the local endpoint. */
   nghttp2_settings_storage local_settings;
+  /* HPACK desync recovery state.  0 if no recovery is in progress.
+     1 if SETTINGS_HEADER_TABLE_SIZE = 0 has been submitted to force
+     the remote encoder to empty its dynamic table, and its ACK is
+     awaited.  2 if the original table size has been submitted to
+     restore the table size, and its ACK is awaited. */
+  uint8_t hd_recovery;
+  /* The number of HPACK desync recovery attempts made within
+     hd_recovery_window_start seconds. */
+  uint8_t hd_recovery_count;
+  /* The timestamp (in seconds) when the current HPACK desync recovery
+     attempt window started. */
+  uint64_t hd_recovery_window_start;
+  /* The local SETTINGS_HEADER_TABLE_SIZE value to restore after an
+     HPACK desync recovery. */
+  uint32_t hd_recovery_table_size;
   /* Option flags. This is bitwise-OR of 0 or more of
      NGHTTP2_OPTMASK_* values. */
   uint32_t opt_flags;

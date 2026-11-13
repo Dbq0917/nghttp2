@@ -56,6 +56,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_nghttp2_session_recv_headers_with_extpri),
   munit_void_test(test_nghttp2_session_server_recv_push_response),
   munit_void_test(test_nghttp2_session_recv_premature_headers),
+  munit_void_test(test_nghttp2_session_hpack_desync_recovery),
   munit_void_test(test_nghttp2_session_recv_unknown_frame),
   munit_void_test(test_nghttp2_session_recv_unexpected_continuation),
   munit_void_test(test_nghttp2_session_recv_settings_header_table_size),
@@ -2985,6 +2986,260 @@ void test_nghttp2_session_recv_premature_headers(void) {
   nghttp2_hd_deflate_free(&deflater);
   nghttp2_session_del(session);
   nghttp2_bufs_free(&bufs);
+}
+
+void test_nghttp2_session_hpack_desync_recovery(void) {
+  nghttp2_session *session;
+  nghttp2_option *option;
+  static const nghttp2_session_callbacks callbacks = {
+    .on_frame_recv_callback = on_frame_recv_callback,
+    .send_callback2 = null_send_callback,
+  };
+  nghttp2_bufs bufs;
+  nghttp2_buf *buf;
+  nghttp2_ssize rv;
+  my_user_data ud;
+  nghttp2_hd_deflater deflater;
+  nghttp2_outbound_item *item;
+  nghttp2_mem *mem;
+  nghttp2_frame frame;
+  nghttp2_stream *stream;
+  uint32_t payloadlen;
+  int32_t stream_id;
+  size_t i;
+
+  mem = nghttp2_mem_default();
+  frame_pack_bufs_init(&bufs);
+
+  nghttp2_option_new(&option);
+  nghttp2_option_set_hpack_desync_recovery(option, 1);
+
+  nghttp2_session_server_new2(&session, &callbacks, &ud, option);
+
+  nghttp2_option_del(option);
+
+  nghttp2_hd_deflate_init(&deflater, mem);
+
+  /* Feed a truncated header block to cause a decompression error. */
+  pack_headers(&bufs, &deflater, 1, NGHTTP2_FLAG_END_HEADERS, reqnv,
+               ARRLEN(reqnv), mem);
+
+  buf = &bufs.head->buf;
+  payloadlen = nghttp2_get_uint32(buf->pos) >> 8;
+  nghttp2_put_uint32be(buf->pos, ((payloadlen - 1) << 8) + buf->pos[3]);
+  rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf) - 1);
+
+  assert_ptrdiff((nghttp2_ssize)(nghttp2_buf_len(buf) - 1), ==, rv);
+
+  /* The affected stream is reset, but the connection must survive. */
+  stream = nghttp2_session_get_stream(session, 1);
+
+  assert_not_null(stream);
+  assert_uint8(NGHTTP2_STREAM_CLOSING, ==, stream->state);
+  assert_int(0, ==, (int)(session->goaway_flags & NGHTTP2_GOAWAY_TERM_ON_SEND));
+  assert_uint8(1, ==, session->hd_recovery);
+
+  /* SETTINGS_HEADER_TABLE_SIZE = 0 must be queued to force the remote
+     encoder to empty its dynamic table. */
+  item = nghttp2_session_get_next_ob_item(session);
+
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_SETTINGS, ==, item->frame.hd.type);
+  assert_size(1, ==, item->frame.settings.niv);
+  assert_uint16(NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, ==,
+                item->frame.settings.iv[0].settings_id);
+  assert_uint32(0, ==, item->frame.settings.iv[0].value);
+
+  nghttp2_bufs_reset(&bufs);
+
+  /* Feed the SETTINGS ACK; the original table size must be submitted
+     to restore it. */
+  nghttp2_frame_settings_init(&frame.settings, NGHTTP2_FLAG_ACK, NULL, 0);
+
+  rv = nghttp2_frame_pack_settings(&bufs, &frame.settings);
+
+  assert_ptrdiff(0, ==, rv);
+
+  nghttp2_frame_settings_free(&frame.settings, mem);
+
+  buf = &bufs.head->buf;
+  rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf));
+
+  assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(buf), ==, rv);
+  assert_uint8(2, ==, session->hd_recovery);
+
+  assert_not_null(session->inflight_settings_head);
+  assert_uint16(NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, ==,
+                session->inflight_settings_head->iv[0].settings_id);
+  assert_uint32(NGHTTP2_HD_DEFAULT_MAX_BUFFER_SIZE, ==,
+                session->inflight_settings_head->iv[0].value);
+
+  nghttp2_bufs_reset(&bufs);
+
+  /* Feed the SETTINGS ACK; recovery is now complete. */
+  nghttp2_frame_settings_init(&frame.settings, NGHTTP2_FLAG_ACK, NULL, 0);
+
+  rv = nghttp2_frame_pack_settings(&bufs, &frame.settings);
+
+  assert_ptrdiff(0, ==, rv);
+
+  nghttp2_frame_settings_free(&frame.settings, mem);
+
+  buf = &bufs.head->buf;
+  rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf));
+
+  assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(buf), ==, rv);
+  assert_uint8(0, ==, session->hd_recovery);
+
+  nghttp2_bufs_reset(&bufs);
+
+  /* The remote peer resynchronizes its encoder as a real peer would:
+     signal table size 0, followed by the restored size.  The header
+     block must be decompressed successfully. */
+  nghttp2_hd_deflate_change_table_size(&deflater, 0);
+  nghttp2_hd_deflate_change_table_size(&deflater,
+                                       NGHTTP2_HD_DEFAULT_MAX_BUFFER_SIZE);
+
+  pack_headers(&bufs, &deflater, 3, NGHTTP2_FLAG_END_HEADERS, reqnv,
+               ARRLEN(reqnv), mem);
+
+  buf = &bufs.head->buf;
+  ud.frame_recv_cb_called = 0;
+  rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf));
+
+  assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(buf), ==, rv);
+  assert_int(1, ==, ud.frame_recv_cb_called);
+
+  /* A decompression error in the middle of a header block: the
+     following CONTINUATION frames must be consumed without being
+     mistaken for a protocol error. */
+  {
+    uint8_t raw[NGHTTP2_FRAME_HDLEN + 3];
+    nghttp2_frame_hd hd;
+
+    hd.length = 3;
+    hd.type = NGHTTP2_HEADERS;
+    hd.flags = NGHTTP2_FLAG_NONE;
+    hd.stream_id = 5;
+
+    nghttp2_frame_pack_frame_hd(raw, &hd);
+    /* Indexed header field, index 1000.  The dynamic table never has
+       that many entries. */
+    raw[NGHTTP2_FRAME_HDLEN] = 0xff;
+    raw[NGHTTP2_FRAME_HDLEN + 1] = 0xe9;
+    raw[NGHTTP2_FRAME_HDLEN + 2] = 0x06;
+
+    rv = nghttp2_session_mem_recv2(session, raw, sizeof(raw));
+
+    assert_ptrdiff((nghttp2_ssize)sizeof(raw), ==, rv);
+    assert_uint8(1, ==, session->hd_recovery);
+    assert_int(0, ==,
+               (int)(session->goaway_flags & NGHTTP2_GOAWAY_TERM_ON_SEND));
+
+    hd.length = 2;
+    hd.type = NGHTTP2_CONTINUATION;
+    hd.flags = NGHTTP2_FLAG_END_HEADERS;
+    hd.stream_id = 5;
+
+    nghttp2_frame_pack_frame_hd(raw, &hd);
+    raw[NGHTTP2_FRAME_HDLEN] = 0x00;
+    raw[NGHTTP2_FRAME_HDLEN + 1] = 0x00;
+
+    rv = nghttp2_session_mem_recv2(session, raw, NGHTTP2_FRAME_HDLEN + 2);
+
+    assert_ptrdiff((nghttp2_ssize)(NGHTTP2_FRAME_HDLEN + 2), ==, rv);
+    assert_uint8(1, ==, session->hd_recovery);
+    assert_int(0, ==,
+               (int)(session->goaway_flags & NGHTTP2_GOAWAY_TERM_ON_SEND));
+
+    /* Complete the recovery cycle. */
+    nghttp2_bufs_reset(&bufs);
+
+    nghttp2_frame_settings_init(&frame.settings, NGHTTP2_FLAG_ACK, NULL, 0);
+    nghttp2_frame_pack_settings(&bufs, &frame.settings);
+    nghttp2_frame_settings_free(&frame.settings, mem);
+
+    buf = &bufs.head->buf;
+    rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf));
+
+    assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(buf), ==, rv);
+    assert_uint8(2, ==, session->hd_recovery);
+
+    nghttp2_bufs_reset(&bufs);
+
+    nghttp2_frame_settings_init(&frame.settings, NGHTTP2_FLAG_ACK, NULL, 0);
+    nghttp2_frame_pack_settings(&bufs, &frame.settings);
+    nghttp2_frame_settings_free(&frame.settings, mem);
+
+    buf = &bufs.head->buf;
+    rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf));
+
+    assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(buf), ==, rv);
+    assert_uint8(0, ==, session->hd_recovery);
+  }
+
+  /* Repeated desyncs within a short period of time exceed the
+     recovery attempt limit, and the connection is terminated. */
+  for (stream_id = 7, i = 0;; stream_id += 2, ++i) {
+    /* Feed a header block that refers to a dynamic table entry which
+       the inflater does not have. */
+    uint8_t raw[NGHTTP2_FRAME_HDLEN + 3];
+    nghttp2_frame_hd hd;
+
+    hd.length = 3;
+    hd.type = NGHTTP2_HEADERS;
+    hd.flags = NGHTTP2_FLAG_END_HEADERS;
+    hd.stream_id = stream_id;
+
+    nghttp2_frame_pack_frame_hd(raw, &hd);
+    /* Indexed header field, index 1000.  The dynamic table never has
+       that many entries. */
+    raw[NGHTTP2_FRAME_HDLEN] = 0xff;
+    raw[NGHTTP2_FRAME_HDLEN + 1] = 0xe9;
+    raw[NGHTTP2_FRAME_HDLEN + 2] = 0x06;
+
+    rv = nghttp2_session_mem_recv2(session, raw, sizeof(raw));
+
+    assert_ptrdiff((nghttp2_ssize)sizeof(raw), ==, rv);
+
+    if (session->goaway_flags & NGHTTP2_GOAWAY_TERM_ON_SEND) {
+      break;
+    }
+
+    assert_true(i + 1 < NGHTTP2_HD_RECOVERY_MAX_ATTEMPTS);
+
+    /* Complete the recovery cycle. */
+    nghttp2_bufs_reset(&bufs);
+
+    nghttp2_frame_settings_init(&frame.settings, NGHTTP2_FLAG_ACK, NULL, 0);
+    nghttp2_frame_pack_settings(&bufs, &frame.settings);
+    nghttp2_frame_settings_free(&frame.settings, mem);
+
+    buf = &bufs.head->buf;
+    rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf));
+
+    assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(buf), ==, rv);
+    assert_uint8(2, ==, session->hd_recovery);
+
+    nghttp2_bufs_reset(&bufs);
+
+    nghttp2_frame_settings_init(&frame.settings, NGHTTP2_FLAG_ACK, NULL, 0);
+    nghttp2_frame_pack_settings(&bufs, &frame.settings);
+    nghttp2_frame_settings_free(&frame.settings, mem);
+
+    buf = &bufs.head->buf;
+    rv = nghttp2_session_mem_recv2(session, buf->pos, nghttp2_buf_len(buf));
+
+    assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(buf), ==, rv);
+    assert_uint8(0, ==, session->hd_recovery);
+  }
+
+  /* 2 recovery episodes (stream 1 and 5) have already been spent. */
+  assert_size(NGHTTP2_HD_RECOVERY_MAX_ATTEMPTS - 2, ==, i);
+
+  nghttp2_bufs_free(&bufs);
+  nghttp2_hd_deflate_free(&deflater);
+  nghttp2_session_del(session);
 }
 
 void test_nghttp2_session_recv_unknown_frame(void) {

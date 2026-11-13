@@ -586,6 +586,11 @@ static int session_new(nghttp2_session **session_ptr,
     if (option->opt_set_mask & NGHTTP2_OPT_MAX_OUTBOUND_QUEUE_SIZE) {
       (*session_ptr)->max_outbound_queue_size = option->max_outbound_queue_size;
     }
+
+    if ((option->opt_set_mask & NGHTTP2_OPT_HPACK_DESYNC_RECOVERY) &&
+        option->hpack_desync_recovery) {
+      (*session_ptr)->opt_flags |= NGHTTP2_OPTMASK_HPACK_DESYNC_RECOVERY;
+    }
   }
 
   rv = nghttp2_hd_deflate_init2(&(*session_ptr)->hd_deflater,
@@ -3575,6 +3580,136 @@ static int session_inflate_handle_invalid_connection(nghttp2_session *session,
 }
 
 /*
+ * Start HPACK desync recovery.  The local inflater and deflater
+ * dynamic tables are reset, and SETTINGS_HEADER_TABLE_SIZE = 0 is
+ * submitted to force the remote encoder to empty its dynamic table
+ * (see RFC 7541, Section 4.2).  When the SETTINGS is acknowledged,
+ * session_update_hd_recovery() restores the original table size, and
+ * both peers resume from an empty, synchronized dynamic table.
+ *
+ * If recovery attempts happen too frequently, this function gives up
+ * and terminates the session.
+ *
+ * This function returns 0 if it succeeds, or one of the negative
+ * error codes:
+ *
+ * NGHTTP2_ERR_NOMEM
+ *     Out of memory.
+ */
+static int session_start_hpack_recovery(nghttp2_session *session) {
+  nghttp2_settings_entry iv;
+  uint64_t now;
+  int rv;
+
+  if (session->hd_recovery == 0) {
+    now = nghttp2_time_now_sec();
+
+    if (now - session->hd_recovery_window_start >=
+        NGHTTP2_HD_RECOVERY_WINDOW_SEC) {
+      session->hd_recovery_window_start = now;
+      session->hd_recovery_count = 0;
+    }
+
+    if (session->hd_recovery_count >= NGHTTP2_HD_RECOVERY_MAX_ATTEMPTS) {
+      /* Desyncs keep happening; the peer is most likely unable to
+         resync.  Give up, and terminate the connection. */
+      return nghttp2_session_terminate_session(session,
+                                               NGHTTP2_COMPRESSION_ERROR);
+    }
+
+    ++session->hd_recovery_count;
+
+    session->hd_recovery_table_size =
+      session->local_settings.header_table_size;
+  }
+
+  /* Reset the inflater so that the header blocks sent after the
+     remote encoder emptied its dynamic table can be decompressed. */
+  nghttp2_hd_inflate_free(&session->hd_inflater);
+
+  rv = nghttp2_hd_inflate_init(&session->hd_inflater, &session->mem);
+  if (rv != 0) {
+    return rv;
+  }
+
+  /* Evict all entries from the deflater dynamic table, and make the
+     next header block signal table size 0 followed by the current
+     size, so that the remote inflater empties its dynamic table as
+     well.  This covers the case where the desync is in the opposite
+     direction. */
+  nghttp2_hd_deflate_change_table_size(&session->hd_deflater, 0);
+  nghttp2_hd_deflate_change_table_size(
+    &session->hd_deflater, session->remote_settings.header_table_size);
+
+  if (session->hd_recovery == 1) {
+    /* SETTINGS_HEADER_TABLE_SIZE = 0 is already in flight. */
+    return 0;
+  }
+
+  iv.settings_id = NGHTTP2_SETTINGS_HEADER_TABLE_SIZE;
+  iv.value = 0;
+
+  rv = nghttp2_session_add_settings(session, NGHTTP2_FLAG_NONE, &iv, 1);
+  if (rv != 0) {
+    return rv;
+  }
+
+  session->hd_recovery = 1;
+
+  return 0;
+}
+
+/*
+ * Update HPACK desync recovery state when a SETTINGS ACK is received.
+ * |acked_table_size| is the acknowledged SETTINGS_HEADER_TABLE_SIZE
+ * value, or -1 if the acknowledged SETTINGS does not contain it.
+ *
+ * This function returns 0 if it succeeds, or one of the negative
+ * error codes:
+ *
+ * NGHTTP2_ERR_NOMEM
+ *     Out of memory.
+ */
+static int session_update_hd_recovery(nghttp2_session *session,
+                                      int64_t acked_table_size) {
+  nghttp2_settings_entry iv;
+
+  if (acked_table_size < 0) {
+    return 0;
+  }
+
+  if (acked_table_size == 0) {
+    if (session->hd_recovery != 1) {
+      return 0;
+    }
+
+    /* The remote encoder has emptied its dynamic table.  Both dynamic
+       tables are now empty and synchronized.  Restore the original
+       table size. */
+    if (session->hd_recovery_table_size == 0) {
+      session->hd_recovery = 0;
+
+      return 0;
+    }
+
+    iv.settings_id = NGHTTP2_SETTINGS_HEADER_TABLE_SIZE;
+    iv.value = session->hd_recovery_table_size;
+
+    session->hd_recovery = 2;
+
+    return nghttp2_session_add_settings(session, NGHTTP2_FLAG_NONE, &iv, 1);
+  }
+
+  if (session->hd_recovery == 2) {
+    /* The original table size has been restored; recovery is
+       complete. */
+    session->hd_recovery = 0;
+  }
+
+  return 0;
+}
+
+/*
  * Inflates header block in the memory pointed by |in| with |inlen|
  * bytes. If this function returns NGHTTP2_ERR_PAUSE, the caller must
  * call this function again, until it returns 0 or one of negative
@@ -3616,6 +3751,16 @@ static int inflate_header_block(nghttp2_session *session, nghttp2_frame *frame,
   *readlen_ptr = 0;
   stream = nghttp2_session_get_stream(session, frame->hd.stream_id);
 
+  if (session->hd_recovery && !call_header_cb) {
+    /* While an HPACK desync recovery is in progress, the inflater has
+       been reset, and must not see the remaining bytes of a header
+       block that is being ignored; feeding them would desynchronize
+       the freshly reset dynamic table again.  Just consume them. */
+    *readlen_ptr = inlen;
+
+    return 0;
+  }
+
   if (frame->hd.type == NGHTTP2_PUSH_PROMISE) {
     /* The associated stream might have been closed or be closing
        while the header block is being received (e.g., RST_STREAM was
@@ -3655,8 +3800,14 @@ static int inflate_header_block(nghttp2_session *session, nghttp2_frame *frame,
           }
         }
       }
-      rv =
-        nghttp2_session_terminate_session(session, NGHTTP2_COMPRESSION_ERROR);
+      if (session->opt_flags & NGHTTP2_OPTMASK_HPACK_DESYNC_RECOVERY) {
+        /* Keep the connection alive, and resynchronize the HPACK
+           dynamic tables. */
+        rv = session_start_hpack_recovery(session);
+      } else {
+        rv =
+          nghttp2_session_terminate_session(session, NGHTTP2_COMPRESSION_ERROR);
+      }
       if (nghttp2_is_fatal(rv)) {
         return rv;
       }
@@ -4517,6 +4668,7 @@ int nghttp2_session_on_settings_received(nghttp2_session *session,
                                          nghttp2_frame *frame, int noack) {
   int rv;
   size_t i;
+  int64_t acked_table_size = -1;
   nghttp2_mem *mem;
   nghttp2_inflight_settings *settings;
 
@@ -4540,6 +4692,14 @@ int nghttp2_session_on_settings_received(nghttp2_session *session,
         session, frame, NGHTTP2_ERR_PROTO, "SETTINGS: unexpected ACK");
     }
 
+    if (session->hd_recovery) {
+      for (i = 0; i < settings->niv; ++i) {
+        if (settings->iv[i].settings_id == NGHTTP2_SETTINGS_HEADER_TABLE_SIZE) {
+          acked_table_size = (int64_t)settings->iv[i].value;
+        }
+      }
+    }
+
     rv = nghttp2_session_update_local_settings(session, settings->iv,
                                                settings->niv);
 
@@ -4553,6 +4713,14 @@ int nghttp2_session_on_settings_received(nghttp2_session *session,
       }
       return session_handle_invalid_connection(session, frame, rv, NULL);
     }
+
+    if (session->hd_recovery) {
+      rv = session_update_hd_recovery(session, acked_table_size);
+      if (rv != 0) {
+        return rv;
+      }
+    }
+
     return session_call_on_frame_received(session, frame);
   }
 
@@ -6783,9 +6951,22 @@ static nghttp2_ssize session_mem_recv(nghttp2_session *session,
         iframe->payloadleft -= readlen;
 
         if (rv == NGHTTP2_ERR_HEADER_COMP) {
-          /* GOAWAY is already issued */
+          /* GOAWAY is already issued, unless HPACK desync recovery is
+             enabled. */
           if (iframe->payloadleft == 0) {
-            session_inbound_frame_reset(session);
+            if ((session->opt_flags & NGHTTP2_OPTMASK_HPACK_DESYNC_RECOVERY) &&
+                (iframe->frame.hd.flags & NGHTTP2_FLAG_END_HEADERS) == 0) {
+              /* Keep ignoring the rest of the header block, so that
+                 the following CONTINUATION frames are not mistaken
+                 for a protocol error. */
+              inbound_frame_set_mark(iframe, NGHTTP2_FRAME_HDLEN);
+
+              iframe->padlen = 0;
+
+              iframe->state = NGHTTP2_IB_IGN_CONTINUATION;
+            } else {
+              session_inbound_frame_reset(session);
+            }
           } else {
             busy = 1;
             iframe->state = NGHTTP2_IB_IGN_PAYLOAD;
@@ -6846,14 +7027,42 @@ static nghttp2_ssize session_mem_recv(nghttp2_session *session,
       case NGHTTP2_HEADERS:
       case NGHTTP2_PUSH_PROMISE:
       case NGHTTP2_CONTINUATION:
-        /* Mark inflater bad so that we won't perform further decoding */
-        session->hd_inflater.ctx.bad = 1;
+        if (session->opt_flags & NGHTTP2_OPTMASK_HPACK_DESYNC_RECOVERY) {
+          /* The ignored header block bytes never reached the
+             inflater, which desynchronizes the dynamic table.  Start
+             recovery instead of poisoning the inflater, and taking
+             down the whole connection. */
+          rv = session_start_hpack_recovery(session);
+          if (nghttp2_is_fatal(rv)) {
+            return rv;
+          }
+
+          if ((iframe->frame.hd.flags & NGHTTP2_FLAG_END_HEADERS) == 0) {
+            /* Keep ignoring the rest of the header block, so that the
+               following CONTINUATION frames are not mistaken for a
+               protocol error. */
+            inbound_frame_set_mark(iframe, NGHTTP2_FRAME_HDLEN);
+
+            iframe->padlen = 0;
+
+            iframe->state = NGHTTP2_IB_IGN_CONTINUATION;
+
+            break;
+          }
+        } else {
+          /* Mark inflater bad so that we won't perform further
+             decoding */
+          session->hd_inflater.ctx.bad = 1;
+        }
+
         break;
       default:
         break;
       }
 
-      session_inbound_frame_reset(session);
+      if (iframe->state == NGHTTP2_IB_IGN_PAYLOAD) {
+        session_inbound_frame_reset(session);
+      }
 
       break;
     case NGHTTP2_IB_FRAME_SIZE_ERROR:
